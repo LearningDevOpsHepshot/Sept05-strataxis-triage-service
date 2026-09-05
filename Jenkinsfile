@@ -1,110 +1,166 @@
 pipeline {
- 
-    // 'agent any' = run on any available machine.
-    // On your standalone setup, that machine is your own laptop.
+
+    // Run the pipeline on the available Jenkins machine.
     agent any
- 
+
     options {
-        timestamps()                       // a clock beside every log line
-        timeout(time: 20, unit: 'MINUTES') // never let a build hang forever
+        // Add the time beside every Jenkins log entry.
+        timestamps()
+
+        // Stop the complete pipeline if it exceeds 40 minutes.
+        timeout(time: 40, unit: 'MINUTES')
+
+        // Keep only the latest 20 Jenkins builds.
         buildDiscarder(logRotator(numToKeepStr: '20'))
+
+        // Prevent Jenkins from performing an additional automatic checkout.
+        skipDefaultCheckout(true)
     }
- 
+
     environment {
-        EVAL_THRESHOLD = '0.85'                    // the agreed quality bar
-        PY      = 'venv\\Scripts\\python.exe'      // Python inside our venv
-        STAGING = 'C:\\stx\\staging'               // stands in for a server
+        // Full location of the Python installation on the laptop.
+        SYSTEM_PYTHON = 'C:\\Users\\riteshindupur\\miniconda3\\python.exe'
+
+        // Minimum acceptable classifier accuracy.
+        EVAL_THRESHOLD = '0.85'
+
+        // Python executable inside the project virtual environment.
+        PY = 'venv\\Scripts\\python.exe'
+
+        // Secure AI key stored in Jenkins Credentials.
+        LLM_API_KEY = credentials('llm-api-key-Sep05')
+
+        // Local folder acting as the staging server.
+        STAGING = 'C:\\stx\\staging'
     }
- 
+
     stages {
- 
+
         stage('1. Checkout') {
             steps {
                 echo 'Fetching the exact commit that triggered this build...'
+
                 checkout scm
-                bat 'git rev-parse --short HEAD > commit.txt'
-                bat 'type commit.txt'
+
+                bat '''
+                    git rev-parse --short HEAD > commit.txt
+                    type commit.txt
+                '''
             }
         }
- 
+
         stage('2. Environment') {
             steps {
                 echo 'Building a clean, isolated Python environment...'
-                bat 'python -m venv venv'
-                bat '%PY% -m pip install --upgrade pip'
-                bat '%PY% -m pip install -r requirements.txt'
+
+                bat '''
+                    if exist venv rmdir /s /q venv
+                    if not exist reports mkdir reports
+                    if not exist dist mkdir dist
+
+                    "%SYSTEM_PYTHON%" --version
+                    "%SYSTEM_PYTHON%" -m venv venv
+                    "%PY%" -m pip install --upgrade pip
+                    "%PY%" -m pip install -r requirements.txt
+                '''
             }
         }
- 
+
         stage('3. Lint') {
             steps {
                 echo 'Checking code style and obvious errors...'
-                bat '%PY% -m ruff check app tests evals'
+
+                bat '''
+                    "%PY%" -m ruff check app tests evals
+                '''
             }
         }
- 
+
         stage('4. Unit Tests') {
             steps {
-                echo 'Running unit and API smoke tests...'
-                bat '%PY% -m pytest tests -q --junitxml=reports/junit.xml'
+                echo 'Running unit tests and API smoke tests...'
+
+                bat '''
+                    "%PY%" -m pytest tests -q --junitxml=reports/junit.xml
+                '''
             }
         }
- 
+
         stage('5. Evaluation Gate') {
             steps {
-                echo 'Measuring AI quality against the labelled set...'
-                bat '%PY% evals\\run_eval.py --threshold %EVAL_THRESHOLD%'
+                echo 'Measuring classifier quality against the labelled dataset...'
+
+                bat '''
+                    "%PY%" evals\\run_eval.py --threshold %EVAL_THRESHOLD%
+                '''
             }
         }
- 
+
         stage('6. Package') {
             steps {
-                echo 'Producing a versioned, shippable artifact...'
-                bat 'if not exist dist mkdir dist'
-                bat 'tar -a -c -f dist/triage-%BUILD_NUMBER%.zip app requirements.txt'
+                echo 'Producing a versioned, shippable ZIP file...'
+
+                bat '''
+                    if not exist dist mkdir dist
+                    tar -a -c -f dist\\triage-%BUILD_NUMBER%.zip app requirements.txt
+                    dir dist
+                '''
             }
         }
- 
+
         stage('7. Approval') {
             steps {
                 script {
                     timeout(time: 15, unit: 'MINUTES') {
-                        input message: 'Deploy build to Strataxis staging?',
-                              ok: 'Approve deployment'
+                        input(
+                            message: 'Deploy this build to Strataxis staging?',
+                            ok: 'Approve deployment'
+                        )
                     }
                 }
             }
         }
- 
+
         stage('8. Deploy to Staging') {
             steps {
-                echo 'Releasing the approved artifact...'
-                bat 'if not exist %STAGING% mkdir %STAGING%'
-                bat 'copy /Y dist\\triage-%BUILD_NUMBER%.zip %STAGING%\\'
-                bat 'echo %DATE% %TIME% build %BUILD_NUMBER% >> %STAGING%\\log.txt'
+                echo 'Releasing the approved artifact to staging...'
+
+                bat '''
+                    if not exist "%STAGING%" mkdir "%STAGING%"
+                    copy /Y "dist\\triage-%BUILD_NUMBER%.zip" "%STAGING%\\"
+                    echo %DATE% %TIME% build %BUILD_NUMBER% >> "%STAGING%\\log.txt"
+                '''
             }
         }
     }
- 
+
     post {
         always {
-            junit allowEmptyResults: true, testResults: 'reports/junit.xml'
-            archiveArtifacts artifacts: 'dist/*.zip, reports/*',
-                             allowEmptyArchive: true, fingerprint: true
-            publishHTML(target: [
-                reportDir            : 'reports',
-                reportFiles          : 'eval_report.html',
-                reportName           : 'Evaluation Report',
-                keepAll              : true,
-                alwaysLinkToLastBuild: true,
-                allowMissing         : true
-            ])
+            echo 'Saving available test results and build artifacts...'
+
+            junit(
+                testResults: 'reports/junit.xml',
+                allowEmptyResults: true
+            )
+
+            archiveArtifacts(
+                artifacts: 'dist/*.zip, reports/*, commit.txt',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
         }
+
         success {
             echo 'GREEN: this commit is safe to show the client.'
+            echo 'The approved package was deployed to staging.'
         }
+
         failure {
-            echo 'RED: something regressed. Nothing was deployed.'
+            echo 'RED: something failed. Nothing was deployed.'
+        }
+
+        aborted {
+            echo 'ABORTED: the build or approval was cancelled.'
         }
     }
 }
